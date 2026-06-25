@@ -20,7 +20,7 @@
 %   - Fixed: Resolved the timeseries indexing error in Step 4 by dynamically converting Simulink's 'SimulationOutput' object ('out') containing timeseries data into a unified MATLAB 'struct' of double arrays.
 % ======================================================================
 
-clear; clc; close all;
+clear all; clc; close all;
 
 %% 0. 작업 환경 경로 검출 및 자동 설정
 fprintf('=== [Step 0] 작업 환경 경로 검출 및 자동 설정 ===\n');
@@ -34,7 +34,18 @@ try
         fprintf('- [주의] 파일 경로를 자동 탐색하지 못했습니다.\n\n');
     end
 catch ME
-    warning('작업 경로 지정 도중 에러가 발생했습니다.');
+    warning('Scenario:PathChangeFailed', '작업 경로 지정 도중 에러가 발생했습니다. 에러: %s', ME.message);
+end
+
+% CSV 파일 저장 전용 폴더 설정 및 생성
+csv_folder = 'csv_data';
+if ~exist(csv_folder, 'dir')
+    try
+        mkdir(csv_folder);
+        fprintf('- CSV 저장용 폴더 생성 완료: %s\n\n', csv_folder);
+    catch mkdir_err
+        warning('Scenario:MkdirFailed', 'CSV 저장 폴더 생성 실패: %s', mkdir_err.message);
+    end
 end
 
 %% 1. 벅 컨버터 물리 파라미터 및 환경 변수 정의
@@ -48,8 +59,11 @@ t_end = 0.1;               % 시뮬레이션 총 시간 (100 ms)
 % 물리 소자 값 정의
 Vin_nom = 12;              % 공칭 입력 전압 (V)
 Vref_val = 5;              % 목표 출력 전압 공칭값 (V)
-L_val = 100e-6;            % 인덕터: 100 uH
-C_val = 220e-6;            % 커패시터: 220 uF
+L_nominal = 100e-6;        % 공칭 인덕터: 100 uH
+C_nominal = 220e-6;        % 공칭 커패시터: 220 uF
+% [수정] 실제 플랜트 불확실성을 반영한 파라미터로 최적화와 시뮬레이션을 동기화 (전략 B: 강인 제어 최적화)
+L_val = 0.7 * L_nominal;   % 실제 인덕터: 70 uH (30% 감소)
+C_val = 1.3 * C_nominal;   % 실제 커패시터: 286 uF (30% 증가)
 R_nom = 5;                 % 공칭 부하 저항: 5 Ohm
 
 % 기생 성분 반영 (손글씨 유도 공식 준수)
@@ -61,12 +75,17 @@ R_C = 0.05;                % 커패시터 등가 직렬 저항(ESR)
 t_vec = (0:T_s:t_end)';
 N_pts = length(t_vec);
 
-% 가변 프로파일 원본 데이터 구성
-Vin_data = Vin_nom * ones(N_pts, 1);
-Vin_data(t_vec >= 0.04) = 15;                       % 40ms: Line Transient (+25% Surge)
-
+% 가변 프로파일 원본 데이터 구성 (극한 성능 평가 시나리오 적용)
+% Scenario A: 가혹한 부하 급변 (Step Load Transient)
 R_data = R_nom * ones(N_pts, 1);
-R_data(t_vec >= 0.07) = 2.5;                        % 70ms: Load Transient (부하 전류 2배 급증)
+R_data(t_vec >= 0.03 & t_vec < 0.07) = 50;          % 30ms ~ 70ms: 경부하 (50 Ohm)
+R_data(t_vec >= 0.07) = 2.0;                        % 70ms ~ 100ms: 중부하 (2 Ohm)
+
+% Scenario B: 입력 전압 서지 및 고주파 노이즈 합성
+Vin_data = Vin_nom * ones(N_pts, 1);
+Vin_data(t_vec >= 0.04) = 18;                       % 40ms: 입력 서지 (+50% Surge, 12V -> 18V)
+rng(42);                                            % 재현성을 위한 난수 시드 고정
+Vin_data = Vin_data + 0.3 * randn(N_pts, 1);        % 전 영역에 고주파 노이즈(RMS 0.3V) 합성
 
 L_data = L_val * ones(N_pts, 1);
 C_data = C_val * ones(N_pts, 1);
@@ -95,7 +114,7 @@ fprintf('- CCM 임계 인덕턴스 (L_crit): %.2f uH\n', L_crit * 1e6);
 if L_val > L_crit
     fprintf('=> [검증 통과] 현재 설계는 전 영역에서 CCM을 완벽히 보장합니다.\n\n');
 else
-    warning('=> [경고] DCM에 진입할 수 있습니다.');
+    warning('Scenario:DCMWarning', '=> [경고] DCM에 진입할 수 있습니다.');
 end
 
 %% 2. 제어기 설계 및 파라미터 튜닝
@@ -127,6 +146,53 @@ fprintf('- [3. ML 최적화 제어기] 분자 [m1 m2 m3 m4 m5 m6] = [%.4e %.4e %
 fprintf('                        분모 [e1 e2 e3 e4 e5 e6] = [%.4e %.4e %.4e %.4e %.4e %.4e]\n', e1, e2, e3, e4, e5, e6);
 fprintf('- [4. 현대제어기 (LQR)] K_lqr1 = %.4f, K_lqr2 = %.4f, K_lqr3 = %.4f\n\n', K_lqr1, K_lqr2, K_lqr3);
 
+% [수정] 이미 1단계에서 실제 플랜트 불확실성을 주입하고 동기화(강인 제어 최적화)를 진행했으므로,
+% 최적화 완료 이후의 중복 인덕터/커패시터 변조 블록은 제거합니다.
+
+% --- [성공] 시스템 및 제어기 파라미터 CSV 저장 ---
+try
+    param_names = {'f_sw'; 'T_s'; 'Vin_nom'; 'Vref_val'; 'L_nominal'; 'C_nominal'; 'L_actual'; 'C_actual'; 'R_nom'; 'G_L'; 'R_C'; 'D_nom'; 'L_crit'};
+    param_values = [f_sw; T_s; Vin_nom; Vref_val; L_nominal; C_nominal; L_val; C_val; R_nom; G_L; R_C; D_nom; L_crit];
+    system_params_table = table(param_names, param_values, 'VariableNames', {'Parameter', 'Value'});
+    writetable(system_params_table, fullfile(csv_folder, 'system_parameters.csv'));
+    fprintf('- [성공] 시스템 파라미터 저장 완료: %s\n', fullfile(csv_folder, 'system_parameters.csv'));
+catch err_sys_param
+    warning('Scenario:SysParamSaveFailed', '시스템 파라미터 CSV 저장 실패: %s', err_sys_param.message);
+end
+
+try
+    ctrl_names = {};
+    coeff_names = {};
+    coeff_values = [];
+    
+    % PI
+    ctrl_names = [ctrl_names; {'PI'; 'PI'}];
+    coeff_names = [coeff_names; {'KP'; 'KI'}];
+    coeff_values = [coeff_values; [KP; KI]];
+    
+    % 3P2Z
+    ctrl_names = [ctrl_names; repmat({'3P2Z'}, 7, 1)];
+    coeff_names = [coeff_names; {'n1'; 'n2'; 'n3'; 'd1'; 'd2'; 'd3'; 'd4'}];
+    coeff_values = [coeff_values; [n1; n2; n3; d1; d2; d3; d4]];
+    
+    % ML
+    ctrl_names = [ctrl_names; repmat({'ML'}, 12, 1)];
+    coeff_names = [coeff_names; {'m1'; 'm2'; 'm3'; 'm4'; 'm5'; 'm6'; 'e1'; 'e2'; 'e3'; 'e4'; 'e5'; 'e6'}];
+    coeff_values = [coeff_values; [m1; m2; m3; m4; m5; m6; e1; e2; e3; e4; e5; e6]];
+    
+    % LQR
+    ctrl_names = [ctrl_names; repmat({'LQR'}, 3, 1)];
+    coeff_names = [coeff_names; {'K_lqr1'; 'K_lqr2'; 'K_lqr3'}];
+    coeff_values = [coeff_values; [K_lqr1; K_lqr2; K_lqr3]];
+    
+    controller_params_table = table(ctrl_names, coeff_names, coeff_values, ...
+        'VariableNames', {'Controller', 'Parameter', 'Value'});
+    writetable(controller_params_table, fullfile(csv_folder, 'controller_parameters.csv'));
+    fprintf('- [성공] 제어기 파라미터 저장 완료: %s\n\n', fullfile(csv_folder, 'controller_parameters.csv'));
+catch err_ctrl_param
+    warning('Scenario:CtrlParamSaveFailed', '제어기 파라미터 CSV 저장 실패: %s', err_ctrl_param.message);
+end
+
 %% 3. 제어 시뮬레이션 실행 (Simulink 및 수치해석 Solver)
 fprintf('=== [Step 3] 시뮬레이션 엔진 구동 ===\n');
 
@@ -141,7 +207,7 @@ if exist(simulink_model_name, 'file') == 4
         simulink_running = true;
         fprintf('=> Simulink 시뮬레이션 성공!\n\n');
     catch sim_err
-        warning('Simulink 실행 중 문제가 발견되어 안전 수치 해석 Solver로 전환합니다.');
+        warning('Scenario:SimulinkFailed', 'Simulink 실행 중 문제가 발견되어 안전 수치 해석 Solver로 전환합니다. 에러: %s', sim_err.message);
         fprintf('\n================== [에러 추적] ==================\n');
         disp(getReport(sim_err, 'extended'));
         fprintf('=================================================\n\n');
@@ -261,7 +327,8 @@ if ~simulink_running
         I_L_ref = Vref_data(k) / R_k;
         duty_lqr_nom = Vref_data(k) / V_in_k;
         
-        duty_lqr_next = duty_lqr_nom - ( K_lqr1 * (x_plant_lqr(1) - I_L_ref) + K_lqr2 * (x_plant_lqr(2) - Vref_data(k)) + K_lqr3 * error_int_lqr );
+        % [수정] 피드백 타겟을 V_out_lqr로 유지하되, LQR 최적화 비용 함수(evaluate_cost) 내부와 일치하도록 + K_lqr3 부호로 통일
+        duty_lqr_next = duty_lqr_nom - ( K_lqr1 * (x_plant_lqr(1) - I_L_ref) + K_lqr2 * (V_out_lqr - Vref_data(k)) + K_lqr3 * error_int_lqr );
         duty_lqr_next = max(0.01, min(0.95, duty_lqr_next));
         
         x_plant_lqr = rk4_step(A_k, B_k, x_plant_lqr, v_sw_lqr, dt);
@@ -332,7 +399,7 @@ ylim([0, 7.5]);
 subplot(3, 1, 2);
 hold on; grid on; box on;
 safe_plot(out.tout * 1000, out.I_L,   color_pi,   1.2, 'PI');
-safe_plot(out.tout * 1000, out.I_L1,  color_3p2z, 1.5, '3P2Z/Type II');
+safe_plot(out.tout * 1000, out.I_L1,  color_3p2z, 1.5, '3P2Z/Type III');
 safe_plot(out.tout * 1000, out.I_L2,  color_ml,   1.5, 'ML-Optimized');
 safe_plot(out.tout * 1000, out.I_L3,  color_lqr,  1.8, 'Modern LQR');
 
@@ -343,11 +410,10 @@ line([70 70], [-1 10], 'Color', 'm', 'LineStyle', '--', 'LineWidth', 1.0, 'Handl
 ylim([0, 7.0]);
 
 % (3) 시비율 제어 입력 비교 그래프 (Duty Ratio)
-% [개선 완료] safe_plot을 도입해 어떤 상황에서도 절대 플롯팅 차원 에러가 발생하지 않음
 subplot(3, 1, 3);
 hold on; grid on; box on;
 safe_plot(out.tout * 1000, out.Duty,  color_pi,   1.2, 'PI');
-safe_plot(out.tout * 1000, out.Duty1, color_3p2z, 1.5, '3P2Z/Type II');
+safe_plot(out.tout * 1000, out.Duty1, color_3p2z, 1.5, '3P2Z/Type III');
 safe_plot(out.tout * 1000, out.Duty2, color_ml,   1.5, 'ML-Optimized');
 safe_plot(out.tout * 1000, out.Duty3, color_lqr,  1.8, 'Modern LQR');
 
@@ -359,6 +425,112 @@ line([70 70], [-1 2], 'Color', 'm', 'LineStyle', '--', 'LineWidth', 1.0, 'Handle
 ylim([0, 1.0]);
 
 alignSubplots;
+
+%% Figure 2: 각 제어기별 개별 상세 응답 (출력 전압 & Duty Ratio)
+fig2 = figure('Position', [150, 100, 1200, 800], 'Name', 'Controller Individual Responses');
+
+% (1) PI 제어기
+subplot(2, 2, 1);
+yyaxis left;
+safe_plot(out.tout * 1000, out.V_Real, color_pi, 1.5, 'V_{out} (PI)');
+ylabel('출력 전압 V_{out} (V)', 'FontWeight', 'bold');
+ylim([0, 7.5]);
+yyaxis right;
+safe_plot(out.tout * 1000, out.Duty, color_pi, 1.2, 'Duty (PI)', '--');
+ylabel('스위칭 Duty Ratio (d)', 'FontWeight', 'bold');
+ylim([0, 1.0]);
+grid on;
+title('PI Controller Detail', 'FontSize', 10, 'FontWeight', 'bold');
+
+% (2) 3P2Z 제어기
+subplot(2, 2, 2);
+yyaxis left;
+safe_plot(out.tout * 1000, out.V_Real1, color_3p2z, 1.5, 'V_{out} (3P2Z)');
+ylabel('출력 전압 V_{out} (V)', 'FontWeight', 'bold');
+ylim([0, 7.5]);
+yyaxis right;
+safe_plot(out.tout * 1000, out.Duty1, color_3p2z, 1.2, 'Duty (3P2Z)', '--');
+ylabel('스위칭 Duty Ratio (d)', 'FontWeight', 'bold');
+ylim([0, 1.0]);
+grid on;
+title('3P2Z (Type III k-factor) Detail', 'FontSize', 10, 'FontWeight', 'bold');
+
+% (3) ML 제어기
+subplot(2, 2, 3);
+yyaxis left;
+safe_plot(out.tout * 1000, out.V_Real2, color_ml, 1.5, 'V_{out} (ML)');
+ylabel('출력 전압 V_{out} (V)', 'FontWeight', 'bold');
+ylim([0, 7.5]);
+yyaxis right;
+safe_plot(out.tout * 1000, out.Duty2, color_ml, 1.2, 'Duty (ML)', '--');
+ylabel('스위칭 Duty Ratio (d)', 'FontWeight', 'bold');
+ylim([0, 1.0]);
+grid on;
+title('ML-Optimized 5th-Order TF Detail', 'FontSize', 10, 'FontWeight', 'bold');
+
+% (4) LQR 제어기
+subplot(2, 2, 4);
+yyaxis left;
+safe_plot(out.tout * 1000, out.V_Real3, color_lqr, 1.5, 'V_{out} (LQR)');
+ylabel('출력 전압 V_{out} (V)', 'FontWeight', 'bold');
+ylim([0, 7.5]);
+yyaxis right;
+safe_plot(out.tout * 1000, out.Duty3, color_lqr, 1.2, 'Duty (LQR)', '--');
+ylabel('스위칭 Duty Ratio (d)', 'FontWeight', 'bold');
+ylim([0, 1.0]);
+grid on;
+title('Modern LQR with FF Detail', 'FontSize', 10, 'FontWeight', 'bold');
+
+xlabel('시간 (ms)', 'FontWeight', 'bold');
+
+%% 6. 성능 지표 및 시뮬레이션 결과 데이터 CSV 저장
+fprintf('=== [Step 6] 성능 지표 및 시뮬레이션 결과 CSV 저장 ===\n');
+
+% (1) 성능 지표 저장
+try
+    writetable(Performance_Table, fullfile(csv_folder, 'performance_metrics.csv'));
+    fprintf('- [성공] 성능 지표 저장 완료: %s\n', fullfile(csv_folder, 'performance_metrics.csv'));
+catch err_perf
+    warning('Scenario:CSVPerfFailed', '성능 지표 CSV 저장 실패: %s', err_perf.message);
+end
+
+% (2) 시뮬레이션 결과 시계열 데이터 저장
+try
+    t_out = out.tout(:);
+    N_pts_out = length(t_out);
+    
+    V_PI   = interpolate_vector(out.V_Real(:), N_pts_out);
+    I_PI   = interpolate_vector(out.I_L(:), N_pts_out);
+    D_PI   = interpolate_vector(out.Duty(:), N_pts_out);
+    
+    V_3P2Z = interpolate_vector(out.V_Real1(:), N_pts_out);
+    I_3P2Z = interpolate_vector(out.I_L1(:), N_pts_out);
+    D_3P2Z = interpolate_vector(out.Duty1(:), N_pts_out);
+    
+    V_ML   = interpolate_vector(out.V_Real2(:), N_pts_out);
+    I_ML   = interpolate_vector(out.I_L2(:), N_pts_out);
+    D_ML   = interpolate_vector(out.Duty2(:), N_pts_out);
+    
+    V_LQR  = interpolate_vector(out.V_Real3(:), N_pts_out);
+    I_LQR  = interpolate_vector(out.I_L3(:), N_pts_out);
+    D_LQR  = interpolate_vector(out.Duty3(:), N_pts_out);
+    
+    SimResults_Table = table(t_out, ...
+        V_PI, I_PI, D_PI, ...
+        V_3P2Z, I_3P2Z, D_3P2Z, ...
+        V_ML, I_ML, D_ML, ...
+        V_LQR, I_LQR, D_LQR, ...
+        'VariableNames', {'Time', ...
+        'V_out_PI', 'I_L_PI', 'Duty_PI', ...
+        'V_out_3P2Z', 'I_L_3P2Z', 'Duty_3P2Z', ...
+        'V_out_ML', 'I_L_ML', 'Duty_ML', ...
+        'V_out_LQR', 'I_L_LQR', 'Duty_LQR'});
+        
+    writetable(SimResults_Table, fullfile(csv_folder, 'simulation_results.csv'));
+    fprintf('- [성공] 시뮬레이션 결과 저장 완료: %s\n\n', fullfile(csv_folder, 'simulation_results.csv'));
+catch err_sim
+    warning('Scenario:CSVSimFailed', '시뮬레이션 결과 CSV 저장 실패: %s', err_sim.message);
+end
 
 %% ========================== 보조 함수 (Helper Functions) ==========================
 
@@ -440,18 +612,21 @@ function metrics = calculate_metrics(v, t, v_target)
     metrics.SSE = abs(v_target - v_final);
 end
 
-function safe_plot(t, y, color, width, name)
+function safe_plot(t, y, color, width, name, style)
     % Simulink 데이터 로깅 길이 차이 문제를 100% 방어하는 선형 보간형 하이레벨 플롯팅 함수
+    if nargin < 6
+        style = '-';
+    end
     t = t(:);
     y = y(:);
     if isempty(t) || isempty(y)
         return;
     end
     if length(t) == length(y)
-        plot(t, y, 'Color', color, 'LineWidth', width, 'DisplayName', name);
+        plot(t, y, style, 'Color', color, 'LineWidth', width, 'DisplayName', name);
     else
         y_interp = interp1(linspace(0, 1, length(y)), y, linspace(0, 1, length(t)), 'linear');
-        plot(t, y_interp, 'Color', color, 'LineWidth', width, 'DisplayName', name);
+        plot(t, y_interp, style, 'Color', color, 'LineWidth', width, 'DisplayName', name);
     end
 end
 
@@ -462,5 +637,14 @@ function alignSubplots
         pos = get(subPlots(idx), 'Position');
         pos(2) = pos(2) - 0.02; 
         set(subPlots(idx), 'Position', pos);
+    end
+end
+
+function y_interp = interpolate_vector(y, N_target)
+    y = y(:);
+    if length(y) == N_target
+        y_interp = y;
+    else
+        y_interp = interp1(linspace(0, 1, length(y)), y, linspace(0, 1, N_target), 'linear')';
     end
 end
