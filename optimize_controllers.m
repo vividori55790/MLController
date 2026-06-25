@@ -73,9 +73,9 @@ function [pi_gains, type3_coeffs, ml_coeffs, lqr_gains] = optimize_controllers(.
 
     %% 1. PI 제어기 최적화
     fprintf('- PI 제어기 최적화 중...\n');
-    pi_init = [0.08, 500]; % [Kp, Ki] (물리 공간)
-    lb_pi = [0.001, 0.1];
-    ub_pi = [2.0, 10000];
+    pi_init = [0.08, 1000]; % [Kp, Ki] (물리 공간) - 균형 잡힌 초기 튜닝점 지정
+    lb_pi = [0.005, 50];    % 하한선을 완화하여 오버슈트/포화 패널티 회피를 위한 자율성 제공
+    ub_pi = [2.5, 10000];
     
     % [-10, 10] 논리 공간으로 매핑
     pi_init_logical = to_logical_space(pi_init, lb_pi, ub_pi);
@@ -100,9 +100,9 @@ function [pi_gains, type3_coeffs, ml_coeffs, lqr_gains] = optimize_controllers(.
     %% 2. Type 3 (3P2Z) 제어기 최적화 (z-영역 극/영점 직접 최적화)
     fprintf('- Type 3 (3P2Z) 제어기 최적화 중...\n');
     % 최적화 변수: [log_Kc, log_wz1, log_wz2, log_wp1, log_wp2] (물리 공간)
-    type3_init = [log(1000), log(2*pi*500), log(2*pi*500), log(2*pi*4500), log(2*pi*4500)];
+    type3_init = [log(1000), log(2*pi*300), log(2*pi*300), log(2*pi*3000), log(2*pi*3000)];
     lb_type3 = [-5, log(2*pi*50), log(2*pi*50), log(2*pi*500), log(2*pi*500)];
-    ub_type3 = [15, log(2*pi*15000), log(2*pi*15000), log(2*pi*40000), log(2*pi*40000)];
+    ub_type3 = [15, log(2*pi*2000), log(2*pi*2000), log(2*pi*10000), log(2*pi*10000)];
     
     % [-10, 10] 논리 공간으로 매핑
     type3_init_logical = to_logical_space(type3_init, lb_type3, ub_type3);
@@ -156,9 +156,9 @@ function [pi_gains, type3_coeffs, ml_coeffs, lqr_gains] = optimize_controllers(.
     %% 4. 현대 제어기 (Augmented LQR) 최적화
     fprintf('- Augmented LQR 제어기 최적화 중...\n');
     % 최적화 변수: [log_q1, log_q2, log_q3, log_R] (물리 공간)
-    lqr_init = [log(10), log(100), log(1e5), log(1)];
-    lb_lqr = [log(1e-3), log(1e-3), log(1e-3), log(1e-4)];
-    ub_lqr = [log(1e6), log(1e6), log(1e9), log(1e4)];
+    lqr_init = [log(10), log(100), log(1e5), log(10)]; % R 이득 상향으로 제어 입력 얌전하게 시작
+    lb_lqr = [log(1e-3), log(1e-3), log(1e-3), log(1e-2)]; % R 하한선 대폭 상향(0.01) 및 Q 적분 폭주 제한
+    ub_lqr = [log(1e6), log(1e6), log(1e9), log(1e4)];     % 가중치 과대 성장 억제
     
     % [-10, 10] 논리 공간으로 매핑
     lqr_init_logical = to_logical_space(lqr_init, lb_lqr, ub_lqr);
@@ -322,25 +322,38 @@ function cost = evaluate_cost(ctrl_type, p_logical, sys, lb_phys, ub_phys)
         switch ctrl_type
             case 'PI'
                 error_int = error_int + err * dt;
-                duty_next = Kp_val * err + Ki_val * error_int;
+                duty_next_raw = Kp_val * err + Ki_val * error_int;
+                duty_next = max(0.01, min(0.95, duty_next_raw));
+                % Anti-Windup Clamping: 포화 발생 시 적분 중지
+                if duty_next_raw > 0.95 && err > 0
+                    error_int = error_int - err * dt;
+                elseif duty_next_raw < 0.01 && err < 0
+                    error_int = error_int - err * dt;
+                end
             case '3P2Z'
                 err_hist = [err; err_hist(1:5)];
-                duty_next = n1*err_hist(1) + n2*err_hist(2) + n3*err_hist(3) ...
-                          - d2*u_hist(1) - d3*u_hist(2) - d4*u_hist(3);
+                duty_next_raw = n1*err_hist(1) + n2*err_hist(2) + n3*err_hist(3) ...
+                              - d2*u_hist(1) - d3*u_hist(2) - d4*u_hist(3);
+                duty_next = max(0.01, min(0.95, duty_next_raw));
                 u_hist = [duty_next; u_hist(1:5)];
             case 'ML'
                 err_hist = [err; err_hist(1:5)];
-                duty_next = (m1*err_hist(1) + m2*err_hist(2) + m3*err_hist(3) + m4*err_hist(4) + m5*err_hist(5) + m6*err_hist(6) ...
-                           - e2*u_hist(1) - e3*u_hist(2) - e4*u_hist(3) - e5*u_hist(4) - e6*u_hist(5)) / e1;
+                duty_next_raw = (m1*err_hist(1) + m2*err_hist(2) + m3*err_hist(3) + m4*err_hist(4) + m5*err_hist(5) + m6*err_hist(6) ...
+                               - e2*u_hist(1) - e3*u_hist(2) - e4*u_hist(3) - e5*u_hist(4) - e6*u_hist(5)) / e1;
+                duty_next = max(0.01, min(0.95, duty_next_raw));
                 u_hist = [duty_next; u_hist(1:5)];
             case 'LQR'
                 error_int = error_int + err * dt;
                 I_L_ref = sys.Vref_data(k) / R_k;
                 duty_nom = sys.Vref_data(k) / V_in_k;
-                duty_next = duty_nom - ( K_lqr1 * (x(1) - I_L_ref) + K_lqr2 * (x(2) - sys.Vref_data(k)) + K_lqr3 * error_int );
+                duty_next_raw = duty_nom - ( K_lqr1 * (x(1) - I_L_ref) + K_lqr2 * (x(2) - sys.Vref_data(k)) + K_lqr3 * error_int );
+                duty_next = max(0.01, min(0.95, duty_next_raw));
+                % LQR Anti-Windup Clamping
+                if duty_next_raw > 0.95 || duty_next_raw < 0.01
+                    error_int = error_int - err * dt;
+                end
         end
         
-        duty_next = max(0.01, min(0.95, duty_next));
         x = rk4_step(A_k, B_k, x, v_sw, dt);
         duty = duty_next;
     end
@@ -352,11 +365,14 @@ function cost = evaluate_cost(ctrl_type, p_logical, sys, lb_phys, ub_phys)
     % 4. [Stage 3] 다목적 패널티 최종 합성 및 듀티 포화 처벌
     itae = sum((sys.t_vec.^2) .* abs(sys.Vref_data - V_out_hist) * dt) * 10;
     
-    % 오버슈트 패널티 부과 (5% 한도 초과 시 대폭 가산)
+    % 오버슈트 패널티 부과 (작은 오버슈트도 즉각 처벌하고, 5% 초과 시 매우 강력하게 가산)
     overshoot = max(V_out_hist) - sys.Vref_val;
     overshoot_penalty = 0;
-    if overshoot > 0.05 * sys.Vref_val
-        overshoot_penalty = 200 * (overshoot - 0.05 * sys.Vref_val);
+    if overshoot > 0
+        overshoot_penalty = overshoot * 2000; % 기본 선형 패널티
+        if overshoot > 0.05 * sys.Vref_val
+            overshoot_penalty = overshoot_penalty + 50000 * (overshoot - 0.05 * sys.Vref_val); % 5% 초과 시 극단적 패널티
+        end
     end
     
     % 듀티비 채터링(급변) 패널티 계산 (과도 상태 제외하고 정상 상태에서의 진동만 억제)
@@ -367,15 +383,32 @@ function cost = evaluate_cost(ctrl_type, p_logical, sys, lb_phys, ub_phys)
     W_chatter(t >= 0.040 & t <= 0.045) = 0;           % Voltage Surge 과도기 (40ms ~ 45ms) 제외
     W_chatter(t >= 0.070 & t <= 0.075) = 0;           % Load Step 과도기 (70ms ~ 75ms) 제외
     
+    % 2차 차분 채터링 패널티
     d_diff2 = diff(diff(duty_hist));
     chatter_penalty = sum(W_chatter(3:end) .* (d_diff2.^2));
     
+    % [추가] 1차 차분 델타 듀티 변화량 패널티 (\Delta D) - 채터링 원천 봉쇄용
+    d_diff1 = diff(duty_hist);
+    chatter_penalty_1st = sum(d_diff1.^2) * 5000;
+    
+    % [개선] 초기 기동 과도기(0ms ~ 5ms) 동안의 자연스러운 포화는 패널티 측정에서 제외
+    valid_sat_idx = t > 0.005; % 5ms 이후 영역만 평가
+    duty_eval = duty_hist(valid_sat_idx);
+    
     % 듀티비 포화(Anti-Windup 방지) 시간 패널티 추가 (0.02 이하 또는 0.94 이상)
-    saturation_time = sum(duty_hist >= 0.94 | duty_hist <= 0.02) * dt;
+    saturation_time = sum(duty_eval >= 0.94 | duty_eval <= 0.02) * dt;
     sat_penalty = saturation_time * 5000;
     
+    % [추가] 조건부 극단 패널티: 5ms 이후 영역에서 포화 비율이 5%를 초과하는 경우 무려 +1e6 추가
+    if ~isempty(duty_eval)
+        sat_ratio = sum(duty_eval >= 0.94 | duty_eval <= 0.02) / length(duty_eval);
+        if sat_ratio > 0.05
+            sat_penalty = sat_penalty + 1e6;
+        end
+    end
+    
     % 최종 비용 합성
-    cost = itae + overshoot_penalty + chatter_penalty + sat_penalty;
+    cost = itae + overshoot_penalty + chatter_penalty + chatter_penalty_1st + sat_penalty;
     
     % 최적화 과정 실시간 업데이트 및 로깅
     manage_optim_data('update', ctrl_type, cost);
@@ -480,22 +513,29 @@ function [m1, m2, m3, m4, m5, m6, e1, e2, e3, e4, e5, e6] = design_ml_tf(p, T_s)
     wp1 = exp(p(7)); zeta_p1 = p(8);
     wp2 = exp(p(9)); zeta_p2 = p(10);
     
-    % 분모/분자 각 컴포넌트별 Backward Euler 이산화 적용
-    % 1) G1(s) = Kc * (s + wz3)/s => G1(z) = Kc * ((1 + wz3*Ts) - z^-1) / (1 - z^-1)
-    num1 = [Kc * (1 + wz3 * T_s), -Kc];
-    den1 = [1, -1];
+    % 공칭 crossover 주파수 대역 (약 1500Hz) 기준으로 프리워핑 인수 K 계산
+    w_warp = 2 * pi * 1500;
+    K = w_warp / tan(w_warp * T_s / 2);
+    
+    % 1) G1(s) = Kc * (s + wz3)/s => G1(z) = Kc * (K*(z-1)/(z+1) + wz3) / (K*(z-1)/(z+1))
+    % G1(z) = Kc * ((K + wz3)*z - (K - wz3)) / (K*(z - 1))
+    num1 = [Kc * (K + wz3), -Kc * (K - wz3)];
+    den1 = [K, -K];
     
     % 2) G2(s) = (s^2 + a1*s + a0) / (s^2 + b1*s + b0)
     a1 = 2 * zeta_z1 * wz1; a0 = wz1^2;
     b1 = 2 * zeta_p1 * wp1; b0 = wp1^2;
-    num2 = [1 + a1*T_s + a0*T_s^2, -(2 + a1*T_s), 1];
-    den2 = [1 + b1*T_s + b0*T_s^2, -(2 + b1*T_s), 1];
+    
+    % s -> K*(z-1)/(z+1) 대입 및 전개
+    num2 = [K^2 + a1*K + a0, 2*(a0 - K^2), K^2 - a1*K + a0];
+    den2 = [K^2 + b1*K + b0, 2*(b0 - K^2), K^2 - b1*K + b0];
     
     % 3) G3(s) = (s^2 + a'1*s + a'0) / (s^2 + b'1*s + b'0)
     a_prime1 = 2 * zeta_z2 * wz2; a_prime0 = wz2^2;
     b_prime1 = 2 * zeta_p2 * wp2; b_prime0 = wp2^2;
-    num3 = [1 + a_prime1*T_s + a_prime0*T_s^2, -(2 + a_prime1*T_s), 1];
-    den3 = [1 + b_prime1*T_s + b_prime0*T_s^2, -(2 + b_prime1*T_s), 1];
+    
+    num3 = [K^2 + a_prime1*K + a_prime0, 2*(a_prime0 - K^2), K^2 - a_prime1*K + a_prime0];
+    den3 = [K^2 + b_prime1*K + b_prime0, 2*(b_prime0 - K^2), K^2 - b_prime1*K + b_prime0];
     
     % 다항식 곱셈을 위한 convolution 적용
     num_d = conv(conv(num1, num2), num3);

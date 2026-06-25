@@ -280,8 +280,14 @@ if ~simulink_running
         V_out_pi = C_k * x_plant_pi + D_k * v_sw_pi;
         err_pi = Vref_data(k) - V_out_pi;
         error_int_pi = error_int_pi + err_pi * dt;
-        duty_pi_next = KP * err_pi + KI * error_int_pi;
-        duty_pi_next = max(0.01, min(0.95, duty_pi_next));
+        duty_pi_next_raw = KP * err_pi + KI * error_int_pi;
+        duty_pi_next = max(0.01, min(0.95, duty_pi_next_raw));
+        % Anti-Windup Clamping: 포화 발생 시 적분 누적 중지
+        if duty_pi_next_raw > 0.95 && err_pi > 0
+            error_int_pi = error_int_pi - err_pi * dt;
+        elseif duty_pi_next_raw < 0.01 && err_pi < 0
+            error_int_pi = error_int_pi - err_pi * dt;
+        end
         
         x_plant_pi = rk4_step(A_k, B_k, x_plant_pi, v_sw_pi, dt);
         out.I_L(k) = x_plant_pi(1); out.V_Real(k) = V_out_pi; out.Duty(k) = duty_pi;
@@ -328,8 +334,12 @@ if ~simulink_running
         duty_lqr_nom = Vref_data(k) / V_in_k;
         
         % [수정] 피드백 타겟을 V_out_lqr로 유지하되, LQR 최적화 비용 함수(evaluate_cost) 내부와 일치하도록 + K_lqr3 부호로 통일
-        duty_lqr_next = duty_lqr_nom - ( K_lqr1 * (x_plant_lqr(1) - I_L_ref) + K_lqr2 * (V_out_lqr - Vref_data(k)) + K_lqr3 * error_int_lqr );
-        duty_lqr_next = max(0.01, min(0.95, duty_lqr_next));
+        duty_lqr_next_raw = duty_lqr_nom - ( K_lqr1 * (x_plant_lqr(1) - I_L_ref) + K_lqr2 * (V_out_lqr - Vref_data(k)) + K_lqr3 * error_int_lqr );
+        duty_lqr_next = max(0.01, min(0.95, duty_lqr_next_raw));
+        % LQR Anti-Windup Clamping
+        if duty_lqr_next_raw > 0.95 || duty_lqr_next_raw < 0.01
+            error_int_lqr = error_int_lqr - err_lqr * dt;
+        end
         
         x_plant_lqr = rk4_step(A_k, B_k, x_plant_lqr, v_sw_lqr, dt);
         out.I_L3(k) = x_plant_lqr(1); out.V_Real3(k) = V_out_lqr; out.Duty3(k) = duty_lqr;
