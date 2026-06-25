@@ -1,0 +1,13 @@
+# MATLAB/Simulink 임시 및 캐시 파일
+*.asv
+*.autosave
+*.slxc
+slprj/
+sfprj/
+*.mex*
+*.log
+
+# OS/시스템 관련 파일
+Thumbs.db
+Desktop.ini
+.DS_Store
